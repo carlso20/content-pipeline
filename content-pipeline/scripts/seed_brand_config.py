@@ -45,7 +45,7 @@ BRANDS = [
             "YOUTUBE_CHANNEL_ID_REMODELING_MARKETING",
             "UC_TODO_remodelingmarketingteam5627",  # Replace after resolving
         ),
-        "buzzsprout_show_id": os.environ.get("BUZZSPROUT_SHOW_ID_REMODELING", None),  # TODO
+        "buzzsprout_show_id": os.environ.get("BUZZSPROUT_SHOW_ID_REMODELING", "2125225"),
         "rag_domains": "remodeling, home improvement, contractor marketing, home services",
         "rag_client_scope": "remodeling_contractors",
         "cta_url": os.environ.get("CTA_URL_REMODELING", None),  # TODO: Add landing page URL
@@ -65,7 +65,7 @@ BRANDS = [
             "YOUTUBE_CHANNEL_ID_AGENT_BRANDING",
             "UC_TODO_agentbrandingmarketing5528",  # Replace after resolving
         ),
-        "buzzsprout_show_id": os.environ.get("BUZZSPROUT_SHOW_ID_AGENT_BRANDING", None),  # TODO
+        "buzzsprout_show_id": os.environ.get("BUZZSPROUT_SHOW_ID_AGENT_BRANDING", "2168365"),
         "rag_domains": "real estate, agent branding, marketing, ABM, lead generation",
         "rag_client_scope": "real_estate_agents",
         "cta_url": os.environ.get("CTA_URL_AGENT_BRANDING", None),  # TODO
@@ -85,7 +85,7 @@ BRANDS = [
             "YOUTUBE_CHANNEL_ID_CARL_WILLIS",
             "UC_TODO_CarlWillis20",  # Replace after resolving
         ),
-        "buzzsprout_show_id": os.environ.get("BUZZSPROUT_SHOW_ID_CARL_WILLIS", None),  # TODO
+        "buzzsprout_show_id": os.environ.get("BUZZSPROUT_SHOW_ID_CARL_WILLIS", "2511435"),
         "rag_domains": "entrepreneurship, business strategy, marketing, leadership, called to build",
         "rag_client_scope": "general_business",
         "cta_url": os.environ.get("CTA_URL_CARL_WILLIS", None),  # TODO
