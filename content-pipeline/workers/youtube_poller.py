@@ -109,6 +109,17 @@ class YouTubePoller:
 
         logger.info("YouTube poll cycle complete")
 
+        # Trigger pipeline for any episodes awaiting processing
+        try:
+            from workers.pipeline import process_pending_episodes
+            process_pending_episodes()
+        except Exception as exc:
+            logger.error(
+                "Pipeline processing failed",
+                error=str(exc),
+                traceback=traceback.format_exc(),
+            )
+
     def _poll_brand(self, brand: BrandConfig) -> None:
         """Poll a single brand channel for new uploads."""
         if not brand.youtube_channel_id or brand.youtube_channel_id.startswith("UC_TODO"):
