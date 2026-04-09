@@ -78,24 +78,37 @@ class YouTubePoller:
         """
         logger.info("YouTube poll cycle started")
         try:
+            # Extract brand IDs only — objects detach when session closes
             with get_session() as session:
-                active_brands = (
+                brand_ids = [
+                    b.id for b in
                     session.query(BrandConfig)
                     .filter(BrandConfig.is_active == True)  # noqa: E712
                     .all()
-                )
+                ]
 
-            if not active_brands:
+            if not brand_ids:
                 logger.warning("No active brands found in brand_config — skipping poll")
                 return
 
-            for brand in active_brands:
+            # Reload each brand in its own session so attributes are always fresh
+            for brand_id in brand_ids:
+                with get_session() as session:
+                    brand = session.query(BrandConfig).filter(
+                        BrandConfig.id == brand_id
+                    ).first()
+                    if not brand:
+                        continue
+                    brand_name = brand.brand_name
+                    channel_id = brand.youtube_channel_id
+
                 try:
-                    self._poll_brand(brand)
+                    self._poll_brand(brand_id)
                 except Exception as exc:
                     logger.error(
                         "Brand poll failed",
-                        brand=brand.brand_name,
+                        brand=brand_name,
+                        channel_id=channel_id,
                         error=str(exc),
                         traceback=traceback.format_exc(),
                     )
@@ -120,58 +133,69 @@ class YouTubePoller:
                 traceback=traceback.format_exc(),
             )
 
-    def _poll_brand(self, brand: BrandConfig) -> None:
-        """Poll a single brand channel for new uploads."""
-        if not brand.youtube_channel_id or brand.youtube_channel_id.startswith("UC_TODO"):
+    def _poll_brand(self, brand_id: int) -> None:
+        """Poll a single brand channel for new uploads. Reloads brand fresh from DB."""
+        # Load brand fresh in its own session to avoid DetachedInstanceError
+        with get_session() as session:
+            brand = session.query(BrandConfig).filter(BrandConfig.id == brand_id).first()
+            if not brand:
+                logger.warning("Brand not found", brand_id=brand_id)
+                return
+            # Capture scalar values while session is open
+            brand_name = brand.brand_name
+            channel_id = brand.youtube_channel_id
+            brand_id_val = brand.id
+
+        if not channel_id or channel_id.startswith("UC_TODO"):
             logger.warning(
                 "Brand has no resolved YouTube channel ID — skipping",
-                brand=brand.brand_name,
-                channel_id=brand.youtube_channel_id,
+                brand=brand_name,
+                channel_id=channel_id,
             )
             return
 
-        logger.info(
-            "Polling brand channel",
-            brand=brand.brand_name,
-            channel_id=brand.youtube_channel_id,
-        )
+        logger.info("Polling brand channel", brand=brand_name, channel_id=channel_id)
 
         # Fetch recent uploads from YouTube
         try:
-            videos = self._fetch_recent_uploads(brand.youtube_channel_id)
+            videos = self._fetch_recent_uploads(channel_id)
         except Exception as exc:
             logger.error(
                 "YouTube API call failed",
-                brand=brand.brand_name,
-                channel_id=brand.youtube_channel_id,
+                brand=brand_name,
+                channel_id=channel_id,
                 error=str(exc),
             )
-            self._increment_consecutive_failures(brand.id)
+            self._increment_consecutive_failures(brand_id_val)
             return
 
         # Update poll timestamp regardless of new videos found
-        self._update_last_polled_at(brand.id)
+        self._update_last_polled_at(brand_id_val)
 
         if not videos:
-            logger.info("No recent uploads found", brand=brand.brand_name)
+            logger.info("No recent uploads found", brand=brand_name)
             return
 
         new_count = 0
         for video in videos:
-            video_id = video["id"]["videoId"]
-            created = self._create_episode_if_new(brand, video)
+            # Reload brand again for episode creation (needs full object)
+            with get_session() as session:
+                brand = session.query(BrandConfig).filter(
+                    BrandConfig.id == brand_id_val
+                ).first()
+                created = self._create_episode_if_new(brand, video)
             if created:
                 new_count += 1
 
         logger.info(
             "Brand poll complete",
-            brand=brand.brand_name,
+            brand=brand_name,
             new_episodes=new_count,
             videos_checked=len(videos),
         )
 
         # Reset failure counter on success
-        self._reset_consecutive_failures(brand.id)
+        self._reset_consecutive_failures(brand_id_val)
 
     @retry(
         retry=retry_if_exception_type(HttpError),
