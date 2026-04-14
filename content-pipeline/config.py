@@ -16,7 +16,7 @@ class Config:
     PORT: int = int(os.environ.get("PORT", 8080))
     ENVIRONMENT: str = os.environ.get("ENVIRONMENT", "development")
     DARK_LAUNCH_MODE: bool = os.environ.get("DARK_LAUNCH_MODE", "true").lower() == "true"
-    POLL_INTERVAL_MINUTES: int = int(os.environ.get("POLL_INTERVAL_MINUTES", 10))
+    POLL_INTERVAL_MINUTES: int = int(os.environ.get("POLL_INTERVAL_MINUTES", 480))
     LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()
 
     # --- Database ---
