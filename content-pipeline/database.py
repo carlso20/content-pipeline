@@ -61,7 +61,7 @@ def init_db() -> None:
         conn.execute(text("SELECT 1"))
     logger.info("Database connection verified")
 
-    _SessionFactory = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
+    _SessionFactory = sessionmaker(bind=_engine, autocommit=False, autoflush=False, expire_on_commit=False)
 
     # Create all tables (idempotent — skips existing tables)
     Base.metadata.create_all(_engine)
