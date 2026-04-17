@@ -1,63 +1,50 @@
 """
 logger.py
 ---------
-Structured JSON logging via structlog.
-- All log events are emitted as JSON for Railway's log drain.
-- Secret values are NEVER passed to the logger; use config.redacted_summary().
+Structured logging via structlog with Railway-compatible output.
+- Logs are emitted as JSON to stdout for Railway's log drain.
+- Secret values are NEVER passed to the logger.
 - Call get_logger(__name__) in every module.
 """
 
 import logging
 import sys
 import structlog
-from config import Config
 
 
 def configure_logging() -> None:
     """
-    Set up structlog with JSON rendering and stdlib integration.
-    Call once at application startup (main.py).
+    Set up structlog with JSON rendering.
+    Uses the simpler PrintLoggerFactory approach which is compatible
+    with structlog 21+ and outputs clean JSON to stdout.
     """
-    log_level = getattr(logging, Config.LOG_LEVEL, logging.INFO)
+    # Determine log level from env (import inline to avoid circular deps)
+    import os
+    log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
 
-    # Configure stdlib logging
+    # Configure stdlib root logger (catches any non-structlog output)
     logging.basicConfig(
-        format="%(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
         level=log_level,
     )
 
-    # Processors applied to every log event
-    shared_processors = [
-        structlog.contextvars.merge_contextvars,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.add_logger_name,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-    ]
-
+    # Configure structlog with a simple, reliable processor chain
     structlog.configure(
-        processors=shared_processors
-        + [
-            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.dev.set_exc_info,
+            structlog.processors.JSONRenderer(),
         ],
-        wrapper_class=structlog.stdlib.BoundLogger,
-        context_class=dict,
-        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
         cache_logger_on_first_use=True,
     )
 
-    # Attach JSON formatter to root handler
-    formatter = structlog.stdlib.ProcessorFormatter(
-        processor=structlog.processors.JSONRenderer(),
-        foreign_pre_chain=shared_processors,
-    )
-    root_logger = logging.getLogger()
-    if root_logger.handlers:
-        root_logger.handlers[0].setFormatter(formatter)
-
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
-    """Return a bound logger for the given module name."""
+    """Return a bound structlog logger for the given module name."""
     return structlog.get_logger(name)

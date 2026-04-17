@@ -13,8 +13,11 @@ and re-running the seed script.
 Requires: YOUTUBE_API_KEY must be set in environment or .env
 """
 
+from __future__ import annotations
+
 import os
 import sys
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -33,7 +36,7 @@ HANDLES_TO_RESOLVE = [
 ]
 
 
-def resolve_handle(youtube_client, handle: str) -> str | None:
+def resolve_handle(youtube_client, handle: str) -> Optional[str]:
     """
     Calls YouTube channels.list with forHandle to get the UCxxxxxx channel ID.
     Returns None if the handle cannot be resolved.

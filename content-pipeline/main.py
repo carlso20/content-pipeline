@@ -19,6 +19,10 @@ import os
 import signal
 import sys
 
+# Plain print before any imports so Railway logs show something even if
+# a dependency import crashes below this line
+print("=== Content Pipeline starting ===", flush=True)
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask
 
