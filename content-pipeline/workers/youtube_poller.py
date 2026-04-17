@@ -2,7 +2,7 @@
 workers/youtube_poller.py
 --------------------------
 YouTube upload detection worker. Runs every POLL_INTERVAL_MINUTES minutes
-via APScheduler.
+via APScheduler (default: 480 minutes / 8 hours).
 
 Poll cycle per brand:
   1. Load active brands from brand_config
@@ -14,9 +14,9 @@ Poll cycle per brand:
 Idempotency: youtube_video_id is the canonical external key.
 Inserting the same ID twice will hit the unique constraint and skip silently.
 
-Quota: at 50 units per channels.list + 1 unit per search.list call,
-polling 3 channels every 10 minutes consumes ~216 units/hour, well within
-the 10,000 daily unit quota.
+Quota: uses playlistItems.list (1 unit) + videos.list (1 unit) per brand.
+At 3 brands × 3 polls/day that's ~18 units/day — well within the 10,000
+daily unit quota. (search.list was avoided because it costs 100 units/call.)
 """
 
 import re
@@ -47,6 +47,35 @@ PATH_B_TAGS = {"#pathb", "#noblog", "#path_b"}
 
 # YouTube Data API search.list returns max 50 results; we only need recent ones
 MAX_RESULTS_PER_POLL = 10
+
+# Minimum video duration in seconds to be considered a full episode (not a short/clip)
+MIN_EPISODE_DURATION_SECONDS = 7 * 60  # 7 minutes
+
+
+def _parse_iso8601_duration(duration_str: str) -> int:
+    """
+    Parse an ISO 8601 duration string (e.g. "PT7M30S", "PT1H2M3S") into seconds.
+    No external library needed — covers the subset YouTube returns.
+    Returns 0 if the string can't be parsed.
+    """
+    if not duration_str:
+        return 0
+    pattern = re.compile(
+        r"P(?:(?P<days>\d+)D)?"
+        r"(?:T"
+        r"(?:(?P<hours>\d+)H)?"
+        r"(?:(?P<minutes>\d+)M)?"
+        r"(?:(?P<seconds>\d+)S)?"
+        r")?"
+    )
+    m = pattern.match(duration_str)
+    if not m:
+        return 0
+    days = int(m.group("days") or 0)
+    hours = int(m.group("hours") or 0)
+    minutes = int(m.group("minutes") or 0)
+    seconds = int(m.group("seconds") or 0)
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
 class YouTubePoller:
@@ -197,6 +226,18 @@ class YouTubePoller:
         # Reset failure counter on success
         self._reset_consecutive_failures(brand_id_val)
 
+    @staticmethod
+    def _uploads_playlist_id(channel_id: str) -> str:
+        """
+        Derive the uploads playlist ID from a YouTube channel ID.
+        Every channel has a system-generated uploads playlist whose ID is the
+        channel ID with the leading "UC" replaced by "UU".
+        Example: UCnqpHHqgpvEs1wkfDMt95uA → UUnqpHHqgpvEs1wkfDMt95uA
+        """
+        if channel_id.startswith("UC"):
+            return "UU" + channel_id[2:]
+        return channel_id  # Fallback — shouldn't happen for valid channel IDs
+
     @retry(
         retry=retry_if_exception_type(HttpError),
         wait=wait_exponential(multiplier=1, min=2, max=30),
@@ -205,26 +246,139 @@ class YouTubePoller:
     )
     def _fetch_recent_uploads(self, channel_id: str) -> list[dict]:
         """
-        Call YouTube Data API search.list to get recent video uploads.
-        Retries on HttpError with exponential backoff (max 3 attempts).
+        Fetch recent public videos from a channel that are longer than
+        MIN_EPISODE_DURATION_SECONDS (default 7 minutes).
+
+        Uses the channel's uploads playlist (playlistItems.list) instead of
+        search.list to stay within YouTube Data API quota:
+          - search.list costs 100 units per call
+          - playlistItems.list costs 1 unit per call
+
+        Two-pass approach:
+          1. playlistItems.list — fetch recent uploads from the channel's
+             auto-generated uploads playlist (1 unit)
+          2. videos.list — enrich with contentDetails (duration) and status
+             (privacyStatus), then filter to public full-length episodes (1 unit)
+
+        Total: ~2 units per brand per poll cycle.
+        At 3 brands × 3 polls/day that's ~18 units/day — well within the
+        10,000 daily quota.
         """
         youtube = self._get_youtube_client()
-        request = youtube.search().list(
-            part="id,snippet",
-            channelId=channel_id,
-            type="video",
-            order="date",
+        uploads_playlist_id = self._uploads_playlist_id(channel_id)
+
+        # Step 1: Fetch the most recent items from the channel's uploads playlist
+        response = youtube.playlistItems().list(
+            part="snippet,contentDetails",
+            playlistId=uploads_playlist_id,
             maxResults=MAX_RESULTS_PER_POLL,
-        )
-        response = request.execute()
+        ).execute()
+
         items = response.get("items", [])
-        # Filter to videoId results only (search can return channels/playlists too)
-        return [item for item in items if item.get("id", {}).get("kind") == "youtube#video"]
+        if not items:
+            return []
+
+        # Normalize playlistItems response to the same shape as search.list items
+        # so that _create_episode_if_new and downstream code are unchanged.
+        candidates = []
+        for item in items:
+            snippet = item.get("snippet", {})
+            resource = snippet.get("resourceId", {})
+            if resource.get("kind") != "youtube#video":
+                continue
+            video_id = resource.get("videoId")
+            if not video_id:
+                continue
+            candidates.append({
+                "id": {"videoId": video_id},
+                "snippet": {
+                    "title": snippet.get("title", ""),
+                    "description": snippet.get("description", ""),
+                    "publishedAt": snippet.get("publishedAt", ""),
+                    "thumbnails": snippet.get("thumbnails", {}),
+                },
+            })
+
+        if not candidates:
+            return []
+
+        # Step 2: Enrich with duration and privacy status via videos.list
+        video_ids = [item["id"]["videoId"] for item in candidates]
+        enriched = self._enrich_video_metadata(video_ids)
+
+        # Step 3: Filter — must be public and >= MIN_EPISODE_DURATION_SECONDS
+        filtered = []
+        for item in candidates:
+            vid = item["id"]["videoId"]
+            meta = enriched.get(vid, {})
+            duration_sec = meta.get("duration_seconds", 0)
+            privacy = meta.get("privacy_status", "")
+            is_public = privacy == "public"
+            is_long_enough = duration_sec >= MIN_EPISODE_DURATION_SECONDS
+
+            if is_public and is_long_enough:
+                # Attach duration to the item so _create_episode_if_new can store it
+                item["_duration_seconds"] = duration_sec
+                filtered.append(item)
+            else:
+                logger.debug(
+                    "Video filtered out",
+                    video_id=vid,
+                    title=item.get("snippet", {}).get("title", "")[:60],
+                    duration_seconds=duration_sec,
+                    privacy_status=privacy,
+                    reason="too_short" if not is_long_enough else "not_public",
+                )
+
+        return filtered
+
+    def _enrich_video_metadata(self, video_ids: list[str]) -> dict[str, dict]:
+        """
+        Call videos.list to get duration and privacy status for a batch of video IDs.
+        Returns a dict keyed by video_id:
+          { "video_id": { "duration_seconds": int, "privacy_status": str } }
+
+        Handles batches of up to 50 IDs per call (YouTube API limit).
+        """
+        youtube = self._get_youtube_client()
+        result = {}
+
+        # Batch in chunks of 50
+        for i in range(0, len(video_ids), 50):
+            batch = video_ids[i:i + 50]
+            response = youtube.videos().list(
+                part="contentDetails,status",
+                id=",".join(batch),
+            ).execute()
+
+            for item in response.get("items", []):
+                vid = item["id"]
+                duration_str = item.get("contentDetails", {}).get("duration", "PT0S")
+                privacy = item.get("status", {}).get("privacyStatus", "unknown")
+
+                try:
+                    duration_sec = _parse_iso8601_duration(duration_str)
+                except Exception:
+                    duration_sec = 0
+
+                result[vid] = {
+                    "duration_seconds": duration_sec,
+                    "privacy_status": privacy,
+                }
+
+        return result
 
     def _create_episode_if_new(self, brand: BrandConfig, video: dict) -> bool:
         """
-        Create an Episode record if the youtube_video_id hasn't been seen before.
-        Returns True if a new record was created, False if it already existed.
+        Create an Episode record if the youtube_video_id hasn't been seen before
+        AND no episode with the same title already exists for this brand.
+
+        The title deduplication guard handles YouTube Podcast syndicated copies:
+        when YouTube auto-creates a podcast episode for a regular video upload,
+        both share the same title but have different video IDs. We keep whichever
+        was seen first and skip the duplicate.
+
+        Returns True if a new record was created, False if skipped.
         """
         video_id = video["id"]["videoId"]
         snippet = video.get("snippet", {})
@@ -235,16 +389,54 @@ class YouTubePoller:
             snippet.get("thumbnails", {}).get("high", {}).get("url")
             or snippet.get("thumbnails", {}).get("default", {}).get("url")
         )
+        duration_seconds = video.get("_duration_seconds")
+
+        # Defense-in-depth: _duration_seconds is only set by _fetch_recent_uploads
+        # when a video passes BOTH the public and minimum-duration filters. If it's
+        # missing here, the enrichment step failed to confirm this is a full-length
+        # episode (e.g. YouTube returned no contentDetails for a Short). Reject it
+        # rather than creating a record that will fail downstream.
+        if not duration_seconds or duration_seconds < MIN_EPISODE_DURATION_SECONDS:
+            logger.warning(
+                "Skipping episode — duration check failed at creation guard "
+                "(enrichment likely returned no contentDetails; possible Short or private video)",
+                video_id=video_id,
+                title=title,
+                duration_seconds=duration_seconds,
+            )
+            return False
 
         with get_session() as session:
-            # Idempotency check — skip if already recorded
-            existing = (
+            # Idempotency check — skip if this video ID was already recorded
+            existing_by_id = (
                 session.query(Episode)
                 .filter(Episode.youtube_video_id == video_id)
                 .first()
             )
-            if existing:
+            if existing_by_id:
                 return False
+
+            # Title deduplication — skip YouTube Podcast syndicated copies
+            # A syndicated copy has the same title as an existing episode for
+            # this brand but a different video ID.
+            if title:
+                existing_by_title = (
+                    session.query(Episode)
+                    .filter(
+                        Episode.brand_config_id == brand.id,
+                        Episode.title == title,
+                    )
+                    .first()
+                )
+                if existing_by_title:
+                    logger.info(
+                        "Skipping duplicate title — likely YouTube Podcast syndication",
+                        brand=brand.brand_name,
+                        youtube_video_id=video_id,
+                        title=title,
+                        existing_video_id=existing_by_title.youtube_video_id,
+                    )
+                    return False
 
             # Detect content path from description tags
             content_path, detection_method = self._detect_content_path(description)
@@ -268,6 +460,7 @@ class YouTubePoller:
                 youtube_published_at=published_at,
                 youtube_url=f"https://www.youtube.com/watch?v={video_id}",
                 thumbnail_url=thumbnail_url,
+                duration_seconds=duration_seconds,
                 content_path=content_path,
                 path_detection_method=detection_method,
                 status=(
@@ -283,6 +476,7 @@ class YouTubePoller:
             brand=brand.brand_name,
             youtube_video_id=video_id,
             title=title,
+            duration_seconds=duration_seconds,
             content_path=content_path,
             detection_method=detection_method,
         )
